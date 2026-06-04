@@ -14,7 +14,7 @@ dependencies = [
     "pandas>=2.0",
     "plotly>=5.20",
     "streamlit>=1.30",
-    "python-binance>=1.0",
+    "requests>=2.0",
 ]
 
 [dependency-groups]
@@ -33,3 +33,7 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["requests.*"]
+ignore_missing_imports = true
