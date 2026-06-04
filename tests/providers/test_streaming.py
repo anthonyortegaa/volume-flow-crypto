@@ -249,3 +249,60 @@ def test_streaming_provider_unexpected_error_sets_error_status() -> None:
     assert _wait_until(lambda: provider.status == ConnectionStatus.ERROR)
     assert provider.last_error == "boom"
     provider.stop()
+
+
+class _ChattyConnection:
+    """Yields the same frame forever, pausing briefly so the loop stays cancellable."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    async def __aenter__(self) -> _ChattyConnection:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def __aiter__(self) -> _ChattyConnection:
+        return self
+
+    async def __anext__(self) -> str:
+        await asyncio.sleep(0.01)
+        return self._message
+
+
+def test_streaming_provider_bounded_queue_drops_oldest_events() -> None:
+    messages = [_raw_event(1000 + index * 60000) for index in range(4)]
+    provider = StreamingBinanceProvider(
+        Symbol("BTCUSDT"),
+        "1m",
+        connect=_Transport([_ScriptedConnection(messages, then="hang")]),
+        backoff_initial=0.0,
+        backoff_max=0.0,
+        idle_timeout=None,
+        queue_maxsize=2,
+    )
+    provider.start()
+    assert _wait_until(lambda: provider.status == ConnectionStatus.CONNECTED)
+    time.sleep(0.3)
+    events = provider.drain()
+    provider.stop()
+
+    assert [event.bar.open_time for event in events] == [
+        datetime.fromtimestamp(121.0, tz=timezone.utc),
+        datetime.fromtimestamp(181.0, tz=timezone.utc),
+    ]
+
+
+def test_streaming_provider_stops_itself_when_consumer_goes_idle() -> None:
+    provider = StreamingBinanceProvider(
+        Symbol("BTCUSDT"),
+        "1m",
+        connect=lambda url: _ChattyConnection(_raw_event(1000)),
+        backoff_initial=0.0,
+        backoff_max=0.0,
+        idle_timeout=0.2,
+    )
+    provider.start()
+    assert _wait_until(lambda: not provider.is_running())
+    assert provider.status == ConnectionStatus.STOPPED

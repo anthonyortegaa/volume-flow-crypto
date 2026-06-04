@@ -57,6 +57,7 @@ From the sidebar you choose:
 - **Symbol** — any Binance spot pair, e.g. `BTCUSDT`, `ETHUSDT`, `SOLUSDT`.
 - **Interval** — `1m`, `5m`, `15m`, `1h`, `4h`, or `1d`.
 - **Bars (lookback)** — how many recent bars to pull.
+- **Live feed** — off by default (poll-on-refresh); toggle on for a live websocket stream.
 
 The page then shows, for that window:
 
@@ -65,7 +66,17 @@ The page then shows, for that window:
 - **Heuristic flags** calling out buy- or sell-side imbalance and above-average volume.
 - A **price candlestick** chart and a **buy/sell volume** chart with a cumulative-delta line.
 
-Data is fetched on demand (poll-on-refresh), so changing an input refetches and redraws.
+By default data is fetched on demand (poll-on-refresh), so changing an input refetches and
+redraws.
+
+### Live feed
+
+Turn on the **Live feed** toggle to stream updates over the Binance kline websocket
+(`data-stream.binance.vision`, the un-geoblocked websocket counterpart of the REST host). The
+window is seeded once from REST history and then the forming bar updates roughly once a second;
+a connection-status line shows connected / reconnecting / error. The stream reconnects on its
+own after a dropped connection, and stops itself if you leave or close the tab. Toggle the
+switch off to return to the poll-on-refresh view.
 
 <!-- Drop a screenshot at docs/dashboard.png and uncomment:
 ![Dashboard](docs/dashboard.png)
@@ -96,18 +107,21 @@ network.
 
 ## Architecture
 
-- `providers/` — all network I/O (the Binance client).
+- `providers/` — all network I/O (the REST client and the websocket streaming client).
 - `metrics/` — pure volume math, no I/O.
+- `live.py` — pure logic merging live websocket updates onto seeded history.
 - `app/` — the Streamlit presentation layer.
 
 ## Limitations & delays
 
 Being upfront about what this tool is and isn't:
 
-- **Not real-time.** It polls on refresh — data updates only when you change an input or rerun
-  the page. There is no streaming or auto-refresh, so the view can be seconds to minutes stale.
-- **Responses are cached for 60 seconds.** Re-running with the same symbol, interval, and
-  lookback inside that window returns the cached data rather than refetching.
+- **Poll-on-refresh by default.** With the live feed off, data updates only when you change an
+  input or rerun the page, so the view can be seconds to minutes stale. The optional **Live
+  feed** toggle streams over the websocket and refreshes the forming bar about once a second.
+- **Responses are cached for 60 seconds (poll mode).** In poll mode, re-running with the same
+  symbol, interval, and lookback inside that window returns cached data; live mode seeds and
+  reseeds from a fresh request instead.
 - **The latest bar is incomplete.** The most recent bar is still forming until its interval
   closes, so its volume, imbalance, and relative-volume reading are partial and will move.
 - **Lookback is capped at 1000 bars.** That's the per-request limit of the Binance klines

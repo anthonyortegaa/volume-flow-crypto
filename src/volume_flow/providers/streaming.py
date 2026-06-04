@@ -4,6 +4,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from enum import Enum
@@ -141,6 +142,11 @@ class StreamingBinanceProvider:
     `KlineEvent`, and pushes it onto a thread-safe queue that the caller drains with `drain()`.
     The connection reconnects on failure with bounded backoff; failures are reflected in
     `status` and `last_error` rather than raised, so they never leak into the caller's thread.
+
+    The queue is bounded and drops the oldest event when full, and the stream stops itself if
+    the caller goes `idle_timeout` seconds without draining — so an abandoned consumer (e.g. a
+    closed browser tab, which Streamlit cannot signal) cannot leak an unbounded queue or a
+    forever-running connection.
     """
 
     def __init__(
@@ -152,14 +158,18 @@ class StreamingBinanceProvider:
         connect: Connect | None = None,
         backoff_initial: float = 1.0,
         backoff_max: float = 30.0,
+        idle_timeout: float | None = 30.0,
+        queue_maxsize: int = 1000,
     ) -> None:
         self._url = f"{base_url.rstrip('/')}/ws/{symbol.lower()}@kline_{interval}"
         self._connect: Connect = connect if connect is not None else _default_connect
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
-        self._queue: queue.Queue[KlineEvent] = queue.Queue()
+        self._idle_timeout = idle_timeout
+        self._queue: queue.Queue[KlineEvent] = queue.Queue(maxsize=queue_maxsize)
         self._status = ConnectionStatus.STOPPED
         self._last_error: str | None = None
+        self._last_active = time.monotonic()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -183,6 +193,7 @@ class StreamingBinanceProvider:
         if self.is_running():
             return
         self._stop = False
+        self._last_active = time.monotonic()
         thread = threading.Thread(target=self._run_loop, name="binance-stream", daemon=True)
         self._thread = thread
         thread.start()
@@ -204,6 +215,7 @@ class StreamingBinanceProvider:
 
     def drain(self) -> list[KlineEvent]:
         """Remove and return every event queued since the last call."""
+        self._last_active = time.monotonic()
         events: list[KlineEvent] = []
         while True:
             try:
@@ -250,7 +262,7 @@ class StreamingBinanceProvider:
                     self._set_status(ConnectionStatus.CONNECTED)
                     backoff.reset()
                     async for raw in connection:
-                        if self._stop:
+                        if self._stop or self._is_idle():
                             return
                         self._handle_message(raw)
             except (OSError, WebSocketException) as exc:
@@ -266,7 +278,21 @@ class StreamingBinanceProvider:
         except (json.JSONDecodeError, ProviderError):
             # A single malformed frame is skipped, not fatal — keep the stream alive.
             return
-        self._queue.put(event)
+        # Single producer: if the queue is full, drop the oldest event and keep the newest.
+        while True:
+            try:
+                self._queue.put_nowait(event)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    return
+
+    def _is_idle(self) -> bool:
+        if self._idle_timeout is None:
+            return False
+        return time.monotonic() - self._last_active > self._idle_timeout
 
     def _set_status(self, status: ConnectionStatus, *, error: str | None = None) -> None:
         with self._lock:
