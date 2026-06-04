@@ -5,6 +5,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# Build artifacts
+dist/
+build/
+
+# Logs
+*.log
+
 # Virtual environments
 .venv/
 venv/

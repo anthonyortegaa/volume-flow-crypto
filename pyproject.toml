@@ -35,5 +35,5 @@ python_version = "3.11"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["requests.*"]
+module = ["requests.*", "plotly.*"]
 ignore_missing_imports = true

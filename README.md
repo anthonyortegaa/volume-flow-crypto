@@ -22,7 +22,11 @@ This is real order-flow data, not an approximation or a reconstructed estimate.
 ## Data source
 
 Market data comes from `data-api.binance.vision`, Binance's public market-data host. It needs
-no API key and is not subject to the regional restrictions that apply to `api.binance.com`.
+no API key and serves the same global market data over plain HTTP.
+
+The usual `api.binance.com` endpoint (and the `python-binance` client that wraps it) is
+geo-restricted in my region, so this tool talks to `data-api.binance.vision` directly with
+`requests` instead. It is not subject to those regional restrictions.
 
 ## Requirements
 
@@ -34,6 +38,31 @@ no API key and is not subject to the regional restrictions that apply to `api.bi
 ```bash
 uv sync
 ```
+
+## Run the dashboard
+
+```bash
+uv run streamlit run src/volume_flow/app/dashboard.py
+```
+
+This opens the app in your browser. From the sidebar you choose:
+
+- **Symbol** — any Binance spot pair, e.g. `BTCUSDT`, `ETHUSDT`, `SOLUSDT`.
+- **Interval** — `1m`, `5m`, `15m`, `1h`, `4h`, or `1d`.
+- **Bars (lookback)** — how many recent bars to pull.
+
+The page then shows, for that window:
+
+- A **metrics panel**: total / buy / sell volume, buy share, order-flow imbalance,
+  buy/sell ratio, net delta, and the latest bar's relative volume.
+- **Heuristic flags** calling out buy- or sell-side imbalance and above-average volume.
+- A **price candlestick** chart and a **buy/sell volume** chart with a cumulative-delta line.
+
+Data is fetched on demand (poll-on-refresh), so changing an input refetches and redraws.
+
+<!-- Drop a screenshot at docs/dashboard.png and uncomment:
+![Dashboard](docs/dashboard.png)
+-->
 
 ## Programmatic use
 
@@ -57,12 +86,6 @@ uv run mypy --strict src
 
 Tests run fully offline against a recorded market-data fixture; the suite never touches the
 network.
-
-## Status
-
-Implemented and tested: the typed data model and the Binance volume provider. In progress:
-the volume metrics layer (volume delta, imbalance, relative volume) and a Streamlit dashboard
-with price candles and a buy/sell volume chart.
 
 ## Architecture
 
