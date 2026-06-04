@@ -35,3 +35,18 @@ class VolumeBar:
     total_volume: float
     buy_volume: float
     sell_volume: float
+
+
+@dataclass(frozen=True, slots=True)
+class KlineEvent:
+    """A single kline-stream update for one bar.
+
+    Attributes:
+        bar: The bar carried by the update, with the same taker buy/sell split as a REST
+            VolumeBar.
+        is_closed: True once the bar's interval has closed and its values are final; False
+            while the bar is still forming and its volume will keep changing.
+    """
+
+    bar: VolumeBar
+    is_closed: bool

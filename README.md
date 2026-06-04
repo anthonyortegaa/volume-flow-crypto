@@ -33,19 +33,26 @@ geo-restricted in my region, so this tool talks to `data-api.binance.vision` dir
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
 
-## Setup
+## How to run
 
-```bash
-uv sync
-```
+From the project root:
 
-## Run the dashboard
+1. Install dependencies. This creates the virtual environment and pulls everything,
+   including a matching Python if you don't have one:
 
-```bash
-uv run streamlit run src/volume_flow/app/dashboard.py
-```
+   ```bash
+   uv sync
+   ```
 
-This opens the app in your browser. From the sidebar you choose:
+2. Launch the dashboard:
+
+   ```bash
+   uv run streamlit run src/volume_flow/app/dashboard.py
+   ```
+
+   Streamlit opens the app in your browser at `http://localhost:8501`.
+
+From the sidebar you choose:
 
 - **Symbol** — any Binance spot pair, e.g. `BTCUSDT`, `ETHUSDT`, `SOLUSDT`.
 - **Interval** — `1m`, `5m`, `15m`, `1h`, `4h`, or `1d`.
@@ -92,6 +99,27 @@ network.
 - `providers/` — all network I/O (the Binance client).
 - `metrics/` — pure volume math, no I/O.
 - `app/` — the Streamlit presentation layer.
+
+## Limitations & delays
+
+Being upfront about what this tool is and isn't:
+
+- **Not real-time.** It polls on refresh — data updates only when you change an input or rerun
+  the page. There is no streaming or auto-refresh, so the view can be seconds to minutes stale.
+- **Responses are cached for 60 seconds.** Re-running with the same symbol, interval, and
+  lookback inside that window returns the cached data rather than refetching.
+- **The latest bar is incomplete.** The most recent bar is still forming until its interval
+  closes, so its volume, imbalance, and relative-volume reading are partial and will move.
+- **Lookback is capped at 1000 bars.** That's the per-request limit of the Binance klines
+  endpoint; the tool makes a single request and does not paginate further history.
+- **Taker-initiated flow only.** The split is taker buy vs. taker sell volume. It reflects who
+  crossed the spread, not resting maker liquidity, and it is not a full order-book reconstruction.
+- **Spot only, one venue.** Binance spot pairs from `data-api.binance.vision`. No futures,
+  options, or other exchanges.
+- **Public, unauthenticated host.** `data-api.binance.vision` has no API key, no SLA, and is
+  subject to rate limits and occasional downtime. Heavy or rapid use can hit those limits, and
+  any fetch failure surfaces as an in-app error rather than crashing.
+- **No persistence.** Nothing is stored; every load refetches and recomputes from scratch.
 
 ## Disclaimer
 

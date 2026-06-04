@@ -1275,6 +1275,7 @@ dependencies = [
     { name = "plotly" },
     { name = "requests" },
     { name = "streamlit" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -1289,6 +1290,7 @@ requires-dist = [
     { name = "plotly", specifier = ">=5.20" },
     { name = "requests", specifier = ">=2.0" },
     { name = "streamlit", specifier = ">=1.30" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [package.metadata.requires-dev]
