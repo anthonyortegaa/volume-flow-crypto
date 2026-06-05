@@ -9,13 +9,15 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from enum import Enum
 from types import TracebackType
-from typing import Protocol
+from typing import Generic, Protocol, TypeVar
 
 import websockets
 from websockets.exceptions import WebSocketException
 
-from volume_flow.models import KlineEvent, Symbol, VolumeBar
+from volume_flow.models import KlineEvent, Symbol, Trade, VolumeBar
 from volume_flow.providers.errors import ProviderError
+
+T = TypeVar("T")
 
 # data-stream.binance.vision is the public market-data websocket host, the streaming counterpart
 # of data-api.binance.vision. Like the REST host it is not geo-restricted and needs no API key.
@@ -83,6 +85,43 @@ def _parse_kline_event(message: object) -> KlineEvent:
     return KlineEvent(bar=bar, is_closed=bool(kline[_IS_CLOSED]))
 
 
+_TRADE_PRICE = "p"
+_TRADE_QUANTITY = "q"
+_TRADE_TIME = "T"
+_TRADE_BUYER_IS_MAKER = "m"
+_REQUIRED_TRADE_FIELDS = (_TRADE_PRICE, _TRADE_QUANTITY, _TRADE_TIME, _TRADE_BUYER_IS_MAKER)
+
+
+def parse_agg_trade(message: object) -> Trade:
+    """Parse a Binance aggTrade message into a Trade.
+
+    The taker side comes from the maker flag: when the buyer is the maker ("m" is true) the
+    taker was selling, otherwise the taker was buying. This is the same taker classification
+    Binance uses to compute kline taker-buy volume, so aggregating these trades reproduces the
+    real buy/sell split.
+
+    Example:
+        >>> parse_agg_trade(
+        ...     {"p": "100.0", "q": "2.5", "T": 1780584600000, "m": False}
+        ... ).is_taker_buy
+        True
+    """
+    if not isinstance(message, dict):
+        raise ProviderError(f"Expected an aggTrade object, got {type(message).__name__}")
+    missing = [field for field in _REQUIRED_TRADE_FIELDS if field not in message]
+    if missing:
+        raise ProviderError(f"aggTrade message missing fields {missing}: {message!r}")
+    try:
+        return Trade(
+            timestamp=datetime.fromtimestamp(int(message[_TRADE_TIME]) / 1000, tz=timezone.utc),
+            price=float(message[_TRADE_PRICE]),
+            quantity=float(message[_TRADE_QUANTITY]),
+            is_taker_buy=not bool(message[_TRADE_BUYER_IS_MAKER]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProviderError(f"Malformed aggTrade {message!r}: {exc}") from exc
+
+
 class ConnectionStatus(Enum):
     STOPPED = "stopped"
     CONNECTING = "connecting"
@@ -135,13 +174,17 @@ class _Backoff:
         return delay
 
 
-class StreamingBinanceProvider:
-    """Live taker buy/sell volume over the Binance kline websocket stream.
+class StreamingBinanceProvider(Generic[T]):
+    """Live market data over a Binance websocket stream.
 
-    Runs an asyncio websocket client on a background thread, parses each kline update into a
-    `KlineEvent`, and pushes it onto a thread-safe queue that the caller drains with `drain()`.
-    The connection reconnects on failure with bounded backoff; failures are reflected in
-    `status` and `last_error` rather than raised, so they never leak into the caller's thread.
+    Subscribes to a named stream (e.g. ``"aggTrade"`` or ``"kline_5m"``), parses each frame
+    with the given `parse` callable on a background thread, and pushes the result onto a
+    thread-safe queue that the caller drains with `drain()`. The connection reconnects on
+    failure with bounded backoff; failures are reflected in `status` and `last_error` rather
+    than raised, so they never leak into the caller's thread.
+
+    The dashboard streams ``aggTrade`` (every trade) for fluid updates; the kline parser is
+    available for callers that want Binance's authoritative per-bar taker volume directly.
 
     The queue is bounded and drops the oldest event when full, and the stream stops itself if
     the caller goes `idle_timeout` seconds without draining — so an abandoned consumer (e.g. a
@@ -152,7 +195,8 @@ class StreamingBinanceProvider:
     def __init__(
         self,
         symbol: Symbol,
-        interval: str,
+        stream: str,
+        parse: Callable[[object], T],
         *,
         base_url: str = _STREAM_BASE_URL,
         connect: Connect | None = None,
@@ -161,12 +205,13 @@ class StreamingBinanceProvider:
         idle_timeout: float | None = 30.0,
         queue_maxsize: int = 1000,
     ) -> None:
-        self._url = f"{base_url.rstrip('/')}/ws/{symbol.lower()}@kline_{interval}"
+        self._url = f"{base_url.rstrip('/')}/ws/{symbol.lower()}@{stream}"
+        self._parse = parse
         self._connect: Connect = connect if connect is not None else _default_connect
         self._backoff_initial = backoff_initial
         self._backoff_max = backoff_max
         self._idle_timeout = idle_timeout
-        self._queue: queue.Queue[KlineEvent] = queue.Queue(maxsize=queue_maxsize)
+        self._queue: queue.Queue[T] = queue.Queue(maxsize=queue_maxsize)
         self._status = ConnectionStatus.STOPPED
         self._last_error: str | None = None
         self._last_active = time.monotonic()
@@ -213,17 +258,17 @@ class StreamingBinanceProvider:
         self._thread = None
         self._set_status(ConnectionStatus.STOPPED)
 
-    def drain(self) -> list[KlineEvent]:
+    def drain(self) -> list[T]:
         """Remove and return every event queued since the last call."""
         self._last_active = time.monotonic()
-        events: list[KlineEvent] = []
+        events: list[T] = []
         while True:
             try:
                 events.append(self._queue.get_nowait())
             except queue.Empty:
                 return events
 
-    def __enter__(self) -> StreamingBinanceProvider:
+    def __enter__(self) -> StreamingBinanceProvider[T]:
         self.start()
         return self
 
@@ -274,7 +319,7 @@ class StreamingBinanceProvider:
 
     def _handle_message(self, raw: str | bytes) -> None:
         try:
-            event = _parse_kline_event(json.loads(raw))
+            event = self._parse(json.loads(raw))
         except (json.JSONDecodeError, ProviderError):
             # A single malformed frame is skipped, not fatal — keep the stream alive.
             return

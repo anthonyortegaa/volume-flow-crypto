@@ -15,13 +15,19 @@ from volume_flow.providers.streaming import (
     ConnectionStatus,
     StreamingBinanceProvider,
     _parse_kline_event,
+    parse_agg_trade,
 )
 
 _FIXTURE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "btcusdt_kline_event.json"
+_TRADE_FIXTURE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "btcusdt_agg_trade.json"
 
 
 def _load_event_message() -> dict[str, Any]:
     return json.loads(_FIXTURE_PATH.read_text())
+
+
+def _load_trade_message() -> dict[str, Any]:
+    return json.loads(_TRADE_FIXTURE_PATH.read_text())
 
 
 # --- Parser ---------------------------------------------------------------------------------
@@ -88,6 +94,48 @@ def test_parse_kline_event_non_numeric_field_raises_provider_error() -> None:
     message["k"]["v"] = "not-a-number"
     with pytest.raises(ProviderError):
         _parse_kline_event(message)
+
+
+# --- aggTrade parser ------------------------------------------------------------------------
+
+
+def test_parse_agg_trade_maps_fields() -> None:
+    message = _load_trade_message()
+    trade = parse_agg_trade(message)
+    assert trade.price == float(message["p"])
+    assert trade.quantity == float(message["q"])
+    assert trade.timestamp == datetime.fromtimestamp(int(message["T"]) / 1000, tz=timezone.utc)
+
+
+def test_parse_agg_trade_buyer_maker_false_is_taker_buy() -> None:
+    message = _load_trade_message()
+    message["m"] = False
+    assert parse_agg_trade(message).is_taker_buy is True
+
+
+def test_parse_agg_trade_buyer_maker_true_is_taker_sell() -> None:
+    message = _load_trade_message()
+    message["m"] = True
+    assert parse_agg_trade(message).is_taker_buy is False
+
+
+def test_parse_agg_trade_non_object_raises_provider_error() -> None:
+    with pytest.raises(ProviderError):
+        parse_agg_trade([1, 2, 3])
+
+
+def test_parse_agg_trade_missing_field_raises_provider_error() -> None:
+    message = _load_trade_message()
+    del message["q"]
+    with pytest.raises(ProviderError):
+        parse_agg_trade(message)
+
+
+def test_parse_agg_trade_non_numeric_field_raises_provider_error() -> None:
+    message = _load_trade_message()
+    message["p"] = "not-a-number"
+    with pytest.raises(ProviderError):
+        parse_agg_trade(message)
 
 
 # --- Streaming provider ---------------------------------------------------------------------
@@ -159,9 +207,14 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 3.0) -> bool:
     return False
 
 
-def _provider(transport: Callable[[str], Any]) -> StreamingBinanceProvider:
+def _provider(transport: Callable[[str], Any]) -> StreamingBinanceProvider[KlineEvent]:
     return StreamingBinanceProvider(
-        Symbol("BTCUSDT"), "1m", connect=transport, backoff_initial=0.0, backoff_max=0.0
+        Symbol("BTCUSDT"),
+        "kline_1m",
+        _parse_kline_event,
+        connect=transport,
+        backoff_initial=0.0,
+        backoff_max=0.0,
     )
 
 
@@ -275,7 +328,8 @@ def test_streaming_provider_bounded_queue_drops_oldest_events() -> None:
     messages = [_raw_event(1000 + index * 60000) for index in range(4)]
     provider = StreamingBinanceProvider(
         Symbol("BTCUSDT"),
-        "1m",
+        "kline_1m",
+        _parse_kline_event,
         connect=_Transport([_ScriptedConnection(messages, then="hang")]),
         backoff_initial=0.0,
         backoff_max=0.0,
@@ -297,7 +351,8 @@ def test_streaming_provider_bounded_queue_drops_oldest_events() -> None:
 def test_streaming_provider_stops_itself_when_consumer_goes_idle() -> None:
     provider = StreamingBinanceProvider(
         Symbol("BTCUSDT"),
-        "1m",
+        "kline_1m",
+        _parse_kline_event,
         connect=lambda url: _ChattyConnection(_raw_event(1000)),
         backoff_initial=0.0,
         backoff_max=0.0,

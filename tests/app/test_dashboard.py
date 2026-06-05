@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timezone
 
-import plotly.graph_objects as go
+import altair as alt
 
 from volume_flow.app import dashboard
 from volume_flow.models import VolumeBar
@@ -30,12 +30,19 @@ def test_format_ratio_infinite_value_reads_all_buys() -> None:
     assert dashboard._format_ratio(math.inf) == "all buys"
 
 
-def test_price_chart_returns_figure() -> None:
-    figure = dashboard._price_chart([_bar(10.0, 5.0), _bar(20.0, 1.0)])
-    assert isinstance(figure, go.Figure)
+def test_price_chart_is_a_layered_candle_chart() -> None:
+    chart = dashboard._price_chart([_bar(10.0, 5.0), _bar(20.0, 1.0)])
+    assert isinstance(chart, alt.LayerChart)
 
 
-def test_volume_chart_has_buy_sell_and_delta_traces() -> None:
-    figure = dashboard._volume_chart([_bar(10.0, 5.0), _bar(20.0, 1.0)])
-    trace_names = {trace.name for trace in figure.data}
-    assert trace_names == {"Buy", "Sell", "Cumulative delta"}
+def test_volume_chart_groups_buy_and_sell_side_by_side() -> None:
+    chart = dashboard._volume_chart([_bar(10.0, 5.0), _bar(20.0, 1.0)])
+    encoding = chart.to_dict()["encoding"]
+    assert "xOffset" in encoding
+
+
+def test_delta_frame_has_cumulative_delta_column() -> None:
+    bars = [_bar(10.0, 5.0), _bar(20.0, 1.0)]
+    frame = dashboard._delta_frame(bars, [5.0, 24.0])
+    assert list(frame.columns) == ["Cumulative delta"]
+    assert list(frame["Cumulative delta"]) == [5.0, 24.0]

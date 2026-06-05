@@ -50,3 +50,21 @@ class KlineEvent:
 
     bar: VolumeBar
     is_closed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Trade:
+    """A single aggregated trade from the live trade stream.
+
+    Attributes:
+        timestamp: Trade time, as a timezone-aware UTC datetime.
+        price: Trade price.
+        quantity: Base-asset quantity traded.
+        is_taker_buy: True when the taker was buying (lifting the ask), False when the taker
+            was selling (hitting the bid).
+    """
+
+    timestamp: datetime
+    price: float
+    quantity: float
+    is_taker_buy: bool

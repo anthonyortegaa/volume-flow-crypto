@@ -14,10 +14,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import plotly.graph_objects as go
+import altair as alt
+import pandas as pd
 import streamlit as st
 
-from volume_flow.live import LiveWindow, interval_to_timedelta
+from volume_flow.live import LiveWindow, TradeAggregator, interval_to_timedelta
 from volume_flow.metrics.signals import SignalFlags, evaluate_signals
 from volume_flow.metrics.volume import (
     buy_fraction,
@@ -29,17 +30,47 @@ from volume_flow.metrics.volume import (
     total_volume,
     volume_imbalance,
 )
-from volume_flow.models import Symbol, VolumeBar
+from volume_flow.models import Symbol, Trade, VolumeBar
 from volume_flow.providers.binance import BinanceProvider
 from volume_flow.providers.errors import ProviderError
-from volume_flow.providers.streaming import ConnectionStatus, StreamingBinanceProvider
+from volume_flow.providers.streaming import (
+    ConnectionStatus,
+    StreamingBinanceProvider,
+    parse_agg_trade,
+)
 
-_INTERVALS = ("1m", "5m", "15m", "1h", "4h", "1d")
-_DEFAULT_INTERVAL = "1h"
+_SYMBOLS = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "TRXUSDT",
+    "DOTUSDT",
+    "LTCUSDT",
+)
+_INTERVALS = ("1m", "5m", "1h", "1d")
+_DEFAULT_INTERVAL = "5m"
+# Candle count scaled per interval as (min, max, default, step): short timeframes show recent
+# activity, long timeframes span more history. Keeps you from staring at 1000 one-minute bars.
+_LOOKBACK: dict[str, tuple[int, int, int, int]] = {
+    "1m": (30, 240, 60, 30),
+    "5m": (24, 288, 72, 24),
+    "1h": (24, 336, 72, 24),
+    "1d": (30, 365, 90, 30),
+}
 _BUY_COLOR = "#26a69a"
 _SELL_COLOR = "#ef5350"
 _DELTA_COLOR = "#42a5f5"
 _LIVE_KEY = "live_session"
+# The numbers are cheap; the charts are heavier, so they refresh on a slower cadence in a
+# separate fragment. The charts are Altair/Vega so they reconcile in place without flashing.
+_NUMBERS_REFRESH = "0.5s"
+_CHART_REFRESH = "1s"
 
 
 @st.cache_resource
@@ -58,106 +89,203 @@ def _seed_bars(symbol: str, interval: str, limit: int) -> list[VolumeBar]:
     return _provider().get_volume_bars(Symbol(symbol), interval, limit=limit)
 
 
-def _price_chart(bars: Sequence[VolumeBar]) -> go.Figure:
-    """Candlestick chart of OHLC prices over the window."""
-    figure = go.Figure(
-        go.Candlestick(
-            x=[bar.open_time for bar in bars],
-            open=[bar.open for bar in bars],
-            high=[bar.high for bar in bars],
-            low=[bar.low for bar in bars],
-            close=[bar.close for bar in bars],
-            increasing_line_color=_BUY_COLOR,
-            decreasing_line_color=_SELL_COLOR,
-            name="Price",
+def _price_chart(bars: Sequence[VolumeBar]) -> alt.LayerChart:
+    """Candlestick chart of OHLC prices, in Altair so it updates without flicker."""
+    frame = pd.DataFrame(
+        {
+            "time": [bar.open_time for bar in bars],
+            "open": [bar.open for bar in bars],
+            "high": [bar.high for bar in bars],
+            "low": [bar.low for bar in bars],
+            "close": [bar.close for bar in bars],
+            "direction": ["up" if bar.close >= bar.open else "down" for bar in bars],
+        }
+    )
+    color = alt.Color(
+        "direction:N",
+        scale=alt.Scale(domain=["up", "down"], range=[_BUY_COLOR, _SELL_COLOR]),
+        legend=None,
+    )
+    # zero=False so the y-axis frames the actual price range instead of squashing the candles
+    # against the top of a 0-based axis.
+    price_scale = alt.Scale(zero=False)
+    base = alt.Chart(frame).encode(x=alt.X("time:T", title=None), color=color)
+    wick = base.mark_rule().encode(
+        y=alt.Y("low:Q", title="Price", scale=price_scale), y2="high:Q"
+    )
+    body = base.mark_bar().encode(y=alt.Y("open:Q", scale=price_scale), y2="close:Q")
+    chart: alt.LayerChart = (wick + body).properties(height=360, width="container")
+    return chart
+
+
+def _volume_chart(bars: Sequence[VolumeBar]) -> alt.Chart:
+    """Buy vs. sell taker volume per bar, grouped side by side via Altair's xOffset."""
+    frame = pd.DataFrame(
+        {
+            "time": [bar.open_time for bar in bars],
+            "Buy": [bar.buy_volume for bar in bars],
+            "Sell": [bar.sell_volume for bar in bars],
+        }
+    )
+    melted = frame.melt("time", var_name="Side", value_name="Volume")
+    chart: alt.Chart = (
+        alt.Chart(melted)
+        .mark_bar()
+        .encode(
+            x=alt.X("time:T", title=None),
+            xOffset=alt.XOffset("Side:N"),
+            y=alt.Y("Volume:Q"),
+            color=alt.Color(
+                "Side:N",
+                scale=alt.Scale(domain=["Buy", "Sell"], range=[_BUY_COLOR, _SELL_COLOR]),
+                legend=alt.Legend(title=None, orient="top"),
+            ),
         )
+        .properties(height=300, width="container")
     )
-    figure.update_layout(
-        height=420,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_rangeslider_visible=False,
-        yaxis_title="Price",
+    return chart
+
+
+def _delta_frame(bars: Sequence[VolumeBar], series: Sequence[float]) -> pd.DataFrame:
+    """Cumulative delta series, indexed by bar time, for a native area chart."""
+    return pd.DataFrame(
+        {"Cumulative delta": list(series)}, index=[bar.open_time for bar in bars]
     )
-    return figure
 
 
-def _volume_chart(bars: Sequence[VolumeBar]) -> go.Figure:
-    """Grouped buy/sell volume bars with cumulative delta on a secondary axis."""
-    times = [bar.open_time for bar in bars]
-    figure = go.Figure()
-    figure.add_bar(
-        x=times, y=[bar.buy_volume for bar in bars], name="Buy", marker_color=_BUY_COLOR
-    )
-    figure.add_bar(
-        x=times, y=[bar.sell_volume for bar in bars], name="Sell", marker_color=_SELL_COLOR
-    )
-    figure.add_scatter(
-        x=times,
-        y=cumulative_delta(bars),
-        name="Cumulative delta",
-        yaxis="y2",
-        line=dict(color=_DELTA_COLOR, width=2),
-    )
-    figure.update_layout(
-        height=360,
-        margin=dict(l=0, r=0, t=10, b=0),
-        barmode="group",
-        yaxis_title="Volume",
-        yaxis2=dict(title="Cumulative delta", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0.0),
-    )
-    return figure
+@dataclass(frozen=True)
+class _Headline:
+    """The four direction-focused figures shown in the top metric row."""
+
+    price: float
+    net_delta: float
+    imbalance: float
+    buy_share: float
 
 
-def _render_metrics(bars: Sequence[VolumeBar]) -> None:
-    """Surface the volume metrics for the window in plain language."""
-    buys = total_buy_volume(bars)
-    sells = total_sell_volume(bars)
-    overall = total_volume(bars)
-    imbalance = volume_imbalance(buys, sells)
-
-    top = st.columns(4)
-    top[0].metric("Total volume", f"{overall:,.0f}")
-    top[1].metric("Buy volume", f"{buys:,.0f}")
-    top[2].metric("Sell volume", f"{sells:,.0f}")
-    top[3].metric("Buy share", f"{buy_fraction(buys, sells) * 100:.1f}%")
-
-    bottom = st.columns(4)
-    bottom[0].metric("Imbalance", f"{imbalance:+.2f}")
-    bottom[1].metric("Buy/sell ratio", _format_ratio(buy_sell_ratio(buys, sells)))
-    bottom[2].metric("Net delta", f"{buys - sells:+,.0f}")
-
-    latest = bars[-1]
-    prior = bars[:-1]
-    if prior:
-        latest_relative_volume = relative_volume(latest, prior)
-        bottom[3].metric("Latest rel. volume", f"{latest_relative_volume:.2f}x")
-        _render_signals(evaluate_signals(imbalance, latest_relative_volume))
-    else:
-        bottom[3].metric("Latest rel. volume", "n/a")
-
-
-def _render_signals(flags: SignalFlags) -> None:
-    """Show the heuristic flags as plain-language callouts."""
-    st.caption("Heuristic flags (not financial advice)")
-    if flags.buy_imbalance:
-        st.success("Buy-side imbalance: takers are lifting the ask more than hitting the bid.")
-    if flags.sell_imbalance:
-        st.error("Sell-side imbalance: takers are hitting the bid more than lifting the ask.")
-    if flags.above_average_volume:
-        st.warning("Above-average volume: the latest bar is unusually active.")
-    if not (flags.buy_imbalance or flags.sell_imbalance or flags.above_average_volume):
-        st.info("Quiet, balanced flow: no heuristic flags on the latest bar.")
+def _signed(current: float, previous: float | None, ndigits: int) -> float | None:
+    """Per-tick change for an st.metric delta arrow, or None when there is no prior tick."""
+    if previous is None:
+        return None
+    return round(current - previous, ndigits)
 
 
 def _format_ratio(ratio: float) -> str:
     return "all buys" if ratio == float("inf") else f"{ratio:.2f}"
 
 
-def _render_charts(bars: Sequence[VolumeBar]) -> None:
-    _render_metrics(bars)
-    st.plotly_chart(_price_chart(bars), width="stretch")
-    st.plotly_chart(_volume_chart(bars), width="stretch")
+def _render_direction(flags: SignalFlags, imbalance: float) -> None:
+    """A single prominent, colored read on which way taker volume is leaning."""
+    if flags.buy_imbalance:
+        st.success(f"Buyers in control — taker flow is buy-heavy (imbalance {imbalance:+.2f}).")
+    elif flags.sell_imbalance:
+        st.error(f"Sellers in control — taker flow is sell-heavy (imbalance {imbalance:+.2f}).")
+    else:
+        st.info(f"Balanced flow — neither side dominates (imbalance {imbalance:+.2f}).")
+    note = "Heuristic read, not financial advice."
+    if flags.above_average_volume:
+        note = "Above-average volume on the latest bar. " + note
+    st.caption(note)
+
+
+def _render_headline(current: _Headline, previous: _Headline | None) -> None:
+    cols = st.columns(4)
+    cols[0].metric(
+        "Price",
+        f"{current.price:,.2f}",
+        delta=_signed(current.price, previous.price if previous else None, 2),
+    )
+    cols[1].metric(
+        "Net delta",
+        f"{current.net_delta:+,.0f}",
+        delta=None if previous is None else int(round(current.net_delta - previous.net_delta)),
+    )
+    cols[2].metric(
+        "Imbalance",
+        f"{current.imbalance:+.2f}",
+        delta=_signed(current.imbalance, previous.imbalance if previous else None, 3),
+    )
+    cols[3].metric(
+        "Buy share",
+        f"{current.buy_share:.1f}%",
+        delta=_signed(current.buy_share, previous.buy_share if previous else None, 2),
+    )
+
+
+def _render_secondary_metrics(bars: Sequence[VolumeBar], buys: float, sells: float) -> None:
+    cols = st.columns(4)
+    cols[0].metric("Total volume", f"{total_volume(bars):,.0f}")
+    cols[1].metric("Buy volume", f"{buys:,.0f}")
+    cols[2].metric("Sell volume", f"{sells:,.0f}")
+    cols[3].metric("Buy/sell ratio", _format_ratio(buy_sell_ratio(buys, sells)))
+
+
+def _candle_stats(bar: VolumeBar) -> None:
+    """Current candle's OHLC, beside the price chart."""
+    st.metric("Open", f"{bar.open:,.2f}")
+    st.metric("High", f"{bar.high:,.2f}")
+    st.metric("Low", f"{bar.low:,.2f}")
+    st.metric("Close", f"{bar.close:,.2f}", delta=round(bar.close - bar.open, 2))
+
+
+def _volume_stats(bar: VolumeBar) -> None:
+    """Current bar's buy/sell split, beside the volume chart."""
+    st.metric("Buy", f"{bar.buy_volume:,.3f}")
+    st.metric("Sell", f"{bar.sell_volume:,.3f}")
+    st.metric("Bar delta", f"{bar.buy_volume - bar.sell_volume:+,.3f}")
+
+
+def _delta_stats(series: Sequence[float]) -> None:
+    """Current cumulative delta and its change this bar, beside the delta chart."""
+    st.metric("Cumulative", f"{series[-1]:+,.2f}")
+    if len(series) >= 2:
+        st.metric("This bar", f"{series[-1] - series[-2]:+,.2f}")
+
+
+def _render_numbers(bars: Sequence[VolumeBar], previous: _Headline | None = None) -> _Headline:
+    """Render the direction banner and metric rows; return the headline for delta tracking."""
+    buys = total_buy_volume(bars)
+    sells = total_sell_volume(bars)
+    imbalance = volume_imbalance(buys, sells)
+    prior = bars[:-1]
+    relative = relative_volume(bars[-1], prior) if prior else 1.0
+    flags = evaluate_signals(imbalance, relative)
+    current = _Headline(
+        price=bars[-1].close,
+        net_delta=buys - sells,
+        imbalance=imbalance,
+        buy_share=buy_fraction(buys, sells) * 100,
+    )
+    _render_direction(flags, imbalance)
+    _render_headline(current, previous)
+    _render_secondary_metrics(bars, buys, sells)
+    return current
+
+
+def _render_chart_panels(bars: Sequence[VolumeBar], interval: str) -> None:
+    """Render the three charts, each with its current-interval stats panel."""
+    st.subheader("Price")
+    chart_col, stats_col = st.columns([4, 1], vertical_alignment="center")
+    chart_col.altair_chart(_price_chart(bars))
+    with stats_col:
+        st.markdown(f"**Current {interval} candle**")
+        _candle_stats(bars[-1])
+
+    st.subheader("Buy vs. sell volume")
+    chart_col, stats_col = st.columns([4, 1], vertical_alignment="center")
+    chart_col.altair_chart(_volume_chart(bars))
+    with stats_col:
+        st.markdown(f"**Current {interval} bar**")
+        _volume_stats(bars[-1])
+
+    st.subheader("Cumulative delta")
+    st.caption("Running buy-minus-sell total. Rising = buyers in control, falling = sellers.")
+    series = cumulative_delta(bars)
+    chart_col, stats_col = st.columns([4, 1], vertical_alignment="center")
+    chart_col.area_chart(_delta_frame(bars, series), color=_DELTA_COLOR, height=240)
+    with stats_col:
+        st.markdown(f"**Current {interval} bar**")
+        _delta_stats(series)
 
 
 @dataclass
@@ -168,8 +296,10 @@ class _LiveSession:
     symbol: str
     interval: str
     lookback: int
-    provider: StreamingBinanceProvider
+    provider: StreamingBinanceProvider[Trade]
     window: LiveWindow
+    aggregator: TradeAggregator
+    previous: _Headline | None = None
 
 
 def _ensure_live_session(symbol: str, interval: str, lookback: int) -> _LiveSession:
@@ -181,10 +311,14 @@ def _ensure_live_session(symbol: str, interval: str, lookback: int) -> _LiveSess
     if existing is not None:
         existing.provider.stop()
     seed = _seed_bars(symbol, interval, lookback)
-    window = LiveWindow(seed, capacity=lookback, interval=interval_to_timedelta(interval))
-    provider = StreamingBinanceProvider(Symbol(symbol), interval)
+    span = interval_to_timedelta(interval)
+    window = LiveWindow(seed, capacity=lookback, interval=span)
+    aggregator = TradeAggregator(seed[-1], span)
+    provider: StreamingBinanceProvider[Trade] = StreamingBinanceProvider(
+        Symbol(symbol), "aggTrade", parse_agg_trade
+    )
     provider.start()
-    session = _LiveSession(key, symbol, interval, lookback, provider, window)
+    session = _LiveSession(key, symbol, interval, lookback, provider, window, aggregator)
     st.session_state[_LIVE_KEY] = session
     return session
 
@@ -202,9 +336,9 @@ def _reseed(session: _LiveSession) -> None:
         seed = _seed_bars(session.symbol, session.interval, session.lookback)
     except ProviderError:
         return
-    session.window = LiveWindow(
-        seed, capacity=session.lookback, interval=interval_to_timedelta(session.interval)
-    )
+    span = interval_to_timedelta(session.interval)
+    session.window = LiveWindow(seed, capacity=session.lookback, interval=span)
+    session.aggregator = TradeAggregator(seed[-1], span)
 
 
 def _render_connection_status(status: ConnectionStatus, last_error: str | None) -> None:
@@ -217,14 +351,16 @@ def _render_connection_status(status: ConnectionStatus, last_error: str | None) 
         st.error(f"Live feed — {status.value}{detail}")
 
 
-@st.fragment(run_every="1s")
-def _live_view() -> None:
-    """Auto-refreshing view: drain new events into the window and redraw once a second."""
+@st.fragment(run_every=_NUMBERS_REFRESH)
+def _live_numbers() -> None:
+    """Fast path: fold new trades into the forming bar and redraw the (flicker-free) numbers."""
     session: _LiveSession | None = st.session_state.get(_LIVE_KEY)
     if session is None:
         return
-    for event in session.provider.drain():
-        session.window.apply(event)
+    for trade in session.provider.drain():
+        event = session.aggregator.add(trade)
+        if event is not None:
+            session.window.apply(event)
     if session.window.needs_reseed:
         _reseed(session)
     _render_connection_status(session.provider.status, session.provider.last_error)
@@ -232,21 +368,79 @@ def _live_view() -> None:
     if not bars:
         st.info("Waiting for the first live update…")
         return
-    _render_charts(bars)
+    session.previous = _render_numbers(bars, previous=session.previous)
+
+
+@st.fragment(run_every=_CHART_REFRESH)
+def _live_charts() -> None:
+    """Slow path: redraw the heavy Plotly charts less often so they don't flash."""
+    session: _LiveSession | None = st.session_state.get(_LIVE_KEY)
+    if session is None:
+        return
+    bars = session.window.bars
+    if not bars:
+        return
+    _render_chart_panels(bars, session.interval)
+
+
+def _format_span(lookback: int, interval: str) -> str:
+    """Human-readable time span covered by `lookback` bars of `interval`."""
+    total = interval_to_timedelta(interval) * lookback
+    hours, remainder = divmod(total.seconds, 3600)
+    minutes = remainder // 60
+    parts = []
+    if total.days:
+        parts.append(f"{total.days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    return " ".join(parts) if parts else "0m"
 
 
 def _sidebar_inputs() -> tuple[str, str, int, bool]:
     """Collect symbol, interval, lookback, and the live toggle from the sidebar."""
     st.sidebar.header("Market")
-    symbol = st.sidebar.text_input("Symbol", value="BTCUSDT").strip().upper()
+    symbol = st.sidebar.selectbox("Symbol", _SYMBOLS)
     interval = st.sidebar.selectbox(
         "Interval", _INTERVALS, index=_INTERVALS.index(_DEFAULT_INTERVAL)
     )
-    lookback = st.sidebar.slider("Bars (lookback)", min_value=24, max_value=1000, value=168, step=24)
-    live = st.sidebar.toggle(
-        "Live feed", value=False, help="Stream updates over the Binance kline websocket."
+    low, high, default, step = _LOOKBACK[interval]
+    # A per-interval key so each timeframe keeps its own scaled lookback across reruns.
+    lookback = st.sidebar.slider(
+        "Bars (lookback)",
+        min_value=low,
+        max_value=high,
+        value=default,
+        step=step,
+        key=f"lookback_{interval}",
     )
+    st.sidebar.caption(f"Window spans ~{_format_span(lookback, interval)}")
+    live = st.sidebar.toggle(
+        "Live feed", value=False, help="Stream every trade live for fluid, real-time updates."
+    )
+    _render_glossary()
     return symbol, interval, lookback, live
+
+
+def _render_glossary() -> None:
+    """A plain-language cheat sheet for the less-obvious metrics, in the sidebar."""
+    with st.sidebar.expander("What the metrics mean"):
+        st.markdown(
+            "**Buy vs. sell volume** — how much was *taker* buying (lifting the ask) vs. "
+            "*taker* selling (hitting the bid). This is real order flow.\n\n"
+            "**Net delta** — buy volume minus sell volume. Positive means more buying pressure.\n\n"
+            "**Imbalance** — net delta scaled to a −1…+1 score. **+1** = all buys, **−1** = all "
+            "sells, **0** = even.\n\n"
+            "**Buy share** — the percent of volume that was buying. Above **50%** means buyers "
+            "were the more aggressive side.\n\n"
+            "**Buy/sell ratio** — buy volume ÷ sell volume. **2.0** means twice as much buying "
+            "as selling.\n\n"
+            "**Cumulative delta** — a running total of net delta across the bars. A **rising** "
+            "line means buyers are in control over time; **falling** means sellers are.\n\n"
+            "**Relative volume** — the latest bar's volume vs. the recent average. **2.0×** means "
+            "it's twice as busy as usual."
+        )
 
 
 def _render_live(symbol: str, interval: str, lookback: int) -> None:
@@ -256,7 +450,9 @@ def _render_live(symbol: str, interval: str, lookback: int) -> None:
         st.error(f"Could not start the live feed: {exc}")
         return
     st.subheader(f"{symbol} · {interval} · live")
-    _live_view()
+    _live_numbers()
+    st.divider()
+    _live_charts()
 
 
 def _render_static(symbol: str, interval: str, lookback: int) -> None:
@@ -266,7 +462,9 @@ def _render_static(symbol: str, interval: str, lookback: int) -> None:
         st.error(f"Could not load market data: {exc}")
         return
     st.subheader(f"{symbol} · {interval} · {len(bars)} bars")
-    _render_charts(bars)
+    _render_numbers(bars)
+    st.divider()
+    _render_chart_panels(bars, interval)
 
 
 def render() -> None:
@@ -276,11 +474,6 @@ def render() -> None:
     st.caption("Real taker buy vs. sell crypto volume from Binance public market data.")
 
     symbol, interval, lookback, live = _sidebar_inputs()
-    if not symbol:
-        _teardown_live_session()
-        st.info("Enter a symbol to begin, e.g. BTCUSDT.")
-        return
-
     if live:
         _render_live(symbol, interval, lookback)
     else:

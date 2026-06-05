@@ -12,10 +12,10 @@ license = { file = "LICENSE" }
 authors = [{ name = "Anthony" }]
 dependencies = [
     "pandas>=2.0",
-    "plotly>=5.20",
     "streamlit>=1.30",
     "requests>=2.0",
     "websockets>=16.0",
+    "altair>=6.1.0",
 ]
 
 [dependency-groups]
@@ -36,5 +36,5 @@ python_version = "3.11"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["requests.*", "plotly.*"]
+module = ["requests.*", "pandas.*"]
 ignore_missing_imports = true

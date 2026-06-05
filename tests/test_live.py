@@ -4,8 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from volume_flow.live import LiveWindow, interval_to_timedelta
-from volume_flow.models import KlineEvent, VolumeBar
+from volume_flow.live import LiveWindow, TradeAggregator, interval_to_timedelta
+from volume_flow.models import KlineEvent, Trade, VolumeBar
 
 _BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _MINUTE = timedelta(minutes=1)
@@ -112,3 +112,81 @@ def test_interval_to_timedelta_rejects_unknown_unit() -> None:
 def test_interval_to_timedelta_rejects_garbage() -> None:
     with pytest.raises(ValueError):
         interval_to_timedelta("abc")
+
+
+_AGG_BASE = datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)
+
+
+def _seed_bar(buy: float, sell: float, *, open_: float, high: float, low: float, close: float) -> VolumeBar:
+    return VolumeBar(
+        open_time=_AGG_BASE,
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        total_volume=buy + sell,
+        buy_volume=buy,
+        sell_volume=sell,
+    )
+
+
+def _trade(second: int, price: float, quantity: float, is_taker_buy: bool) -> Trade:
+    return Trade(
+        timestamp=_AGG_BASE + timedelta(seconds=second),
+        price=price,
+        quantity=quantity,
+        is_taker_buy=is_taker_buy,
+    )
+
+
+def test_aggregator_taker_buy_extends_forming_bar_in_place() -> None:
+    agg = TradeAggregator(_seed_bar(10.0, 5.0, open_=100.0, high=110.0, low=90.0, close=105.0), _MINUTE)
+    event = agg.add(_trade(30, price=120.0, quantity=2.0, is_taker_buy=True))
+    assert event is not None
+    assert event.bar.open_time == _AGG_BASE
+    assert event.bar.open == 100.0
+    assert event.bar.buy_volume == 12.0
+    assert event.bar.sell_volume == 5.0
+    assert event.bar.close == 120.0
+    assert event.bar.high == 120.0
+
+
+def test_aggregator_taker_sell_adds_to_sell_and_low() -> None:
+    agg = TradeAggregator(_seed_bar(10.0, 5.0, open_=100.0, high=110.0, low=90.0, close=105.0), _MINUTE)
+    event = agg.add(_trade(30, price=80.0, quantity=3.0, is_taker_buy=False))
+    assert event is not None
+    assert event.bar.sell_volume == 8.0
+    assert event.bar.buy_volume == 10.0
+    assert event.bar.low == 80.0
+    assert event.bar.close == 80.0
+
+
+def test_aggregator_rolls_over_to_fresh_bar_on_next_interval() -> None:
+    agg = TradeAggregator(_seed_bar(10.0, 5.0, open_=100.0, high=110.0, low=90.0, close=105.0), _MINUTE)
+    event = agg.add(_trade(70, price=200.0, quantity=4.0, is_taker_buy=True))
+    assert event is not None
+    assert event.bar.open_time == _AGG_BASE + _MINUTE
+    assert event.bar.open == 200.0
+    assert event.bar.high == 200.0
+    assert event.bar.low == 200.0
+    assert event.bar.close == 200.0
+    assert event.bar.buy_volume == 4.0
+    assert event.bar.sell_volume == 0.0
+
+
+def test_aggregator_ignores_trade_before_current_bucket() -> None:
+    agg = TradeAggregator(_seed_bar(10.0, 5.0, open_=100.0, high=110.0, low=90.0, close=105.0), _MINUTE)
+    assert agg.add(_trade(-30, price=100.0, quantity=1.0, is_taker_buy=True)) is None
+
+
+def test_aggregator_accumulates_multiple_trades_exactly() -> None:
+    agg = TradeAggregator(_seed_bar(0.0, 0.0, open_=100.0, high=100.0, low=100.0, close=100.0), _MINUTE)
+    agg.add(_trade(10, price=101.0, quantity=1.0, is_taker_buy=True))
+    agg.add(_trade(20, price=99.0, quantity=2.0, is_taker_buy=False))
+    event = agg.add(_trade(30, price=102.0, quantity=1.5, is_taker_buy=True))
+    assert event is not None
+    assert event.bar.buy_volume == 2.5
+    assert event.bar.sell_volume == 2.0
+    assert event.bar.high == 102.0
+    assert event.bar.low == 99.0
+    assert event.bar.close == 102.0

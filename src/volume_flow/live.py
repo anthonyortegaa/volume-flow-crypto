@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
-from volume_flow.models import KlineEvent, VolumeBar
+from volume_flow.models import KlineEvent, Trade, VolumeBar
 
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
@@ -67,3 +67,63 @@ class LiveWindow:
         self._bars.append(bar)
         if len(self._bars) > self._capacity:
             self._bars = self._bars[-self._capacity :]
+
+
+class TradeAggregator:
+    """Folds live aggregated trades into the current forming bar.
+
+    Seeded with the latest historical bar, it updates that bar's price and taker buy/sell
+    volume as trades arrive, and rolls over to a fresh bar when a trade opens the next
+    interval. Each accepted trade yields an updated `KlineEvent` for a `LiveWindow` to merge.
+    The forming bar inherits the seed's volume; once a bar rolls over it is built entirely from
+    trades, so its taker split is exact.
+    """
+
+    def __init__(self, seed: VolumeBar, interval: timedelta) -> None:
+        self._interval = interval
+        self._bar = seed
+
+    def add(self, trade: Trade) -> KlineEvent | None:
+        bucket = self._bucket(trade.timestamp)
+        if bucket < self._bar.open_time:
+            return None
+        if bucket == self._bar.open_time:
+            self._bar = self._extended(self._bar, trade)
+        else:
+            self._bar = self._opened(bucket, trade)
+        return KlineEvent(bar=self._bar, is_closed=False)
+
+    def _bucket(self, timestamp: datetime) -> datetime:
+        milliseconds = int(timestamp.timestamp() * 1000)
+        step = int(self._interval.total_seconds() * 1000)
+        return datetime.fromtimestamp((milliseconds // step) * step / 1000, tz=timezone.utc)
+
+    @staticmethod
+    def _opened(open_time: datetime, trade: Trade) -> VolumeBar:
+        buy = trade.quantity if trade.is_taker_buy else 0.0
+        sell = 0.0 if trade.is_taker_buy else trade.quantity
+        return VolumeBar(
+            open_time=open_time,
+            open=trade.price,
+            high=trade.price,
+            low=trade.price,
+            close=trade.price,
+            total_volume=trade.quantity,
+            buy_volume=buy,
+            sell_volume=sell,
+        )
+
+    @staticmethod
+    def _extended(bar: VolumeBar, trade: Trade) -> VolumeBar:
+        buy = bar.buy_volume + (trade.quantity if trade.is_taker_buy else 0.0)
+        sell = bar.sell_volume + (0.0 if trade.is_taker_buy else trade.quantity)
+        return VolumeBar(
+            open_time=bar.open_time,
+            open=bar.open,
+            high=max(bar.high, trade.price),
+            low=min(bar.low, trade.price),
+            close=trade.price,
+            total_volume=buy + sell,
+            buy_volume=buy,
+            sell_volume=sell,
+        )

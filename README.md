@@ -71,12 +71,19 @@ redraws.
 
 ### Live feed
 
-Turn on the **Live feed** toggle to stream updates over the Binance kline websocket
+Turn on the **Live feed** toggle to stream the trade feed over Binance's websocket
 (`data-stream.binance.vision`, the un-geoblocked websocket counterpart of the REST host). The
-window is seeded once from REST history and then the forming bar updates roughly once a second;
-a connection-status line shows connected / reconnecting / error. The stream reconnects on its
-own after a dropped connection, and stops itself if you leave or close the tab. Toggle the
-switch off to return to the poll-on-refresh view.
+window is seeded once from REST history, then every trade is folded into the forming bar, so
+the candle and volume move fluidly in real time rather than in slow steps. A connection-status
+line shows connected / reconnecting / error; the stream reconnects on its own after a dropped
+connection and stops itself if you leave or close the tab. Toggle the switch off to return to
+the poll-on-refresh view.
+
+Each trade's taker side comes from Binance's maker flag — the same classification used to
+compute kline taker-buy volume — so the live buy/sell split is real order flow. A bar is exact
+once it has rolled over and been built entirely from trades; the first seeded bar can differ by
+a negligible amount of volume traded in the moment between the REST snapshot and the stream
+connecting.
 
 <!-- Drop a screenshot at docs/dashboard.png and uncomment:
 ![Dashboard](docs/dashboard.png)
@@ -109,7 +116,7 @@ network.
 
 - `providers/` — all network I/O (the REST client and the websocket streaming client).
 - `metrics/` — pure volume math, no I/O.
-- `live.py` — pure logic merging live websocket updates onto seeded history.
+- `live.py` — pure logic aggregating live trades into the forming bar and merging onto history.
 - `app/` — the Streamlit presentation layer.
 
 ## Limitations & delays
@@ -118,7 +125,7 @@ Being upfront about what this tool is and isn't:
 
 - **Poll-on-refresh by default.** With the live feed off, data updates only when you change an
   input or rerun the page, so the view can be seconds to minutes stale. The optional **Live
-  feed** toggle streams over the websocket and refreshes the forming bar about once a second.
+  feed** toggle streams every trade and updates the forming bar in real time.
 - **Responses are cached for 60 seconds (poll mode).** In poll mode, re-running with the same
   symbol, interval, and lookback inside that window returns cached data; live mode seeds and
   reseeds from a fresh request instead.
