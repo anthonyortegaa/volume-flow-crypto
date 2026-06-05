@@ -35,7 +35,7 @@ def test_price_chart_is_a_layered_candle_chart() -> None:
     assert isinstance(chart, alt.LayerChart)
 
 
-def test_volume_chart_groups_buy_and_sell_side_by_side() -> None:
+def test_volume_chart_encodes_buy_and_sell_sides() -> None:
     chart = dashboard._volume_chart([_bar(10.0, 5.0), _bar(20.0, 1.0)])
     encoding = chart.to_dict()["encoding"]
     assert "xOffset" in encoding

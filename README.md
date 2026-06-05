@@ -85,9 +85,20 @@ once it has rolled over and been built entirely from trades; the first seeded ba
 a negligible amount of volume traded in the moment between the REST snapshot and the stream
 connecting.
 
-<!-- Drop a screenshot at docs/dashboard.png and uncomment:
-![Dashboard](docs/dashboard.png)
--->
+## Screenshots
+
+Header with live metrics and the buy/sell direction read:
+
+![Overview](docs/overview.png)
+
+Price candles, stacked buy vs. sell volume, and cumulative delta — each with a live
+current-bar stats panel:
+
+![Price candles](docs/price-candles.png)
+
+![Buy vs. sell volume](docs/buy-sell-volume.png)
+
+![Cumulative delta](docs/cumulative-delta.png)
 
 ## Programmatic use
 

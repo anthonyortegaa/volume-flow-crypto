@@ -119,7 +119,7 @@ def _price_chart(bars: Sequence[VolumeBar]) -> alt.LayerChart:
 
 
 def _volume_chart(bars: Sequence[VolumeBar]) -> alt.Chart:
-    """Buy vs. sell taker volume per bar, grouped side by side via Altair's xOffset."""
+    """Buy and sell taker volume per bar, stacked by side."""
     frame = pd.DataFrame(
         {
             "time": [bar.open_time for bar in bars],
