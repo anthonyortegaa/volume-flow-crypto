@@ -157,3 +157,8 @@ Being upfront about what this tool is and isn't:
 
 This tool is for market analysis and education. Any signal flags it surfaces are heuristics,
 not financial advice.
+
+## Authorship
+
+The project's code was written manually. This README and the accompanying docs were drafted
+with Claude.
