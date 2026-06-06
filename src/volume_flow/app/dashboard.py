@@ -89,11 +89,34 @@ def _seed_bars(symbol: str, interval: str, limit: int) -> list[VolumeBar]:
     return _provider().get_volume_bars(Symbol(symbol), interval, limit=limit)
 
 
+def _time_labels(bars: Sequence[VolumeBar]) -> list[str]:
+    """Bar open times as ordinal axis labels, so charts use a width-filling band scale.
+
+    A band scale sizes each bar to a share of the chart width rather than a fixed pixel
+    count, keeping candles and volume bars proportional across display sizes and bar counts.
+    Daily bars drop the (always-midnight) time to keep the label clean.
+    """
+    intraday = any(
+        bar.open_time.hour or bar.open_time.minute or bar.open_time.second for bar in bars
+    )
+    fmt = "%m-%d %H:%M" if intraday else "%Y-%m-%d"
+    return [bar.open_time.strftime(fmt) for bar in bars]
+
+
+def _time_x() -> alt.X:
+    """Band-scale x encoding over ordinal time labels, shared by the bar charts."""
+    return alt.X(
+        "time:N",
+        sort=None,
+        axis=alt.Axis(title=None, labelOverlap=True, labelAngle=-45),
+    )
+
+
 def _price_chart(bars: Sequence[VolumeBar]) -> alt.LayerChart:
     """Candlestick chart of OHLC prices, in Altair so it updates without flicker."""
     frame = pd.DataFrame(
         {
-            "time": [bar.open_time for bar in bars],
+            "time": _time_labels(bars),
             "open": [bar.open for bar in bars],
             "high": [bar.high for bar in bars],
             "low": [bar.low for bar in bars],
@@ -109,7 +132,7 @@ def _price_chart(bars: Sequence[VolumeBar]) -> alt.LayerChart:
     # zero=False so the y-axis frames the actual price range instead of squashing the candles
     # against the top of a 0-based axis.
     price_scale = alt.Scale(zero=False)
-    base = alt.Chart(frame).encode(x=alt.X("time:T", title=None), color=color)
+    base = alt.Chart(frame).encode(x=_time_x(), color=color)
     wick = base.mark_rule().encode(
         y=alt.Y("low:Q", title="Price", scale=price_scale), y2="high:Q"
     )
@@ -122,7 +145,7 @@ def _volume_chart(bars: Sequence[VolumeBar]) -> alt.Chart:
     """Buy and sell taker volume per bar, stacked by side."""
     frame = pd.DataFrame(
         {
-            "time": [bar.open_time for bar in bars],
+            "time": _time_labels(bars),
             "Buy": [bar.buy_volume for bar in bars],
             "Sell": [bar.sell_volume for bar in bars],
         }
@@ -132,7 +155,7 @@ def _volume_chart(bars: Sequence[VolumeBar]) -> alt.Chart:
         alt.Chart(melted)
         .mark_bar()
         .encode(
-            x=alt.X("time:T", title=None),
+            x=_time_x(),
             xOffset=alt.XOffset("Side:N"),
             y=alt.Y("Volume:Q"),
             color=alt.Color(
